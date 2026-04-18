@@ -66,6 +66,12 @@ class ChatRequest(BaseModel):
     message: str
     history: List[ChatMessage] = []
 
+class ToolCallInfo(BaseModel):
+    name: str
+    args: dict
+    result: str
+
 class ChatResponse(BaseModel):
     reply: str
-    logged_entries: List[LogEntryResponse] = []
+    mutated: bool = False
+    tool_calls: List[ToolCallInfo] = []

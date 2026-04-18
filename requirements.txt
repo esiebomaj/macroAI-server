@@ -5,3 +5,5 @@ python-dotenv
 pydantic
 pydantic[email]
 openai
+langchain
+langchain-openai

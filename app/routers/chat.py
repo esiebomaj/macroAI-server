@@ -1,88 +1,130 @@
 import os
 import json
-import re
 from datetime import date
 from fastapi import APIRouter, Depends, HTTPException
-from openai import OpenAI
-from app.schemas import ChatRequest, ChatResponse, LogEntryResponse
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain.agents import create_agent
+
+from app.schemas import ChatRequest, ChatResponse, ToolCallInfo, ChatMessage
 from app.database import get_service_client
 from app.auth_utils import get_current_user
+from app.agent_tools import build_tools
 
 router = APIRouter()
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-SYSTEM_TEMPLATE = """You are a nutrition logging assistant. User's daily goals: {cal}kcal, {pro}g protein, {carb}g carbs, {fat}g fat.
-Food library: {library}.
-Today's log: {log}.
-If the user wants to log food, append a JSON block at the END of your message:
-```log
-[{{"name":"Food","meal":"Breakfast|Lunch|Dinner|Snack","cal":100,"pro":10,"carb":5,"fat":3,"qty":1}}]
-```
-Answer intake/progress questions from the log data. Be brief and specific. Estimate from knowledge if food isn't in library."""
+llm = ChatOpenAI(
+    model="gpt-4o",
+    temperature=0,
+    api_key=os.environ.get("OPENAI_API_KEY", ""),
+)
+
+SYSTEM_TEMPLATE = """You are a nutrition logging assistant for the user's personal macro tracker.
+
+User's daily goals: {cal}kcal, {pro}g protein, {carb}g carbs, {fat}g fat.
+Today's date: {today}.
+Food library (saved favorites): {library}
+Today's log so far: {log}
+
+You have tools to log/modify/remove food entries, manage the food library, and update goals.
+
+Guidelines:
+- When the user describes food they ate, call `log_food` (one call per distinct item).
+- Prefer nutrition values from the library when a close match exists; otherwise estimate from general knowledge.
+- For past-date operations, first call `list_log_entries` with that date to get ids.
+- Only call `update_goals` when the user explicitly asks to change their goals.
+- Be brief and specific. Do not repeat raw tool output verbatim; summarize."""
+
+
+def _to_lc(m: ChatMessage):
+    role = (m.role or "").lower()
+    if role in ("user", "human"):
+        return HumanMessage(content=m.content)
+    return AIMessage(content=m.content)
+
+
+def _load_context(sb, user_id: str):
+    goals_res = sb.table("goals").select("*").eq("user_id", user_id).execute()
+    goals = goals_res.data[0] if goals_res.data else {"cal": 2000, "pro": 160, "carb": 180, "fat": 71}
+
+    lib = sb.table("food_library").select(
+        "name, cal, pro, carb, fat, unit"
+    ).eq("user_id", user_id).execute().data
+
+    log = (
+        sb.table("food_log")
+        .select("id, name, meal, cal, pro, carb, fat, qty")
+        .eq("user_id", user_id)
+        .eq("log_date", str(date.today()))
+        .order("created_at")
+        .execute()
+        .data
+    )
+    return goals, lib, log
+
+
+def _stringify_args(tool_input):
+    if isinstance(tool_input, dict):
+        return tool_input
+    return {"input": str(tool_input)}
 
 
 @router.post("/", response_model=ChatResponse)
 def chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
-    user_id = current_user["user_id"]
     sb = get_service_client()
+    user_id = current_user["user_id"]
 
-    goals = sb.table("goals").select("*").eq("user_id", user_id).execute()
-    g = goals.data[0] if goals.data else {"cal": 2000, "pro": 160, "carb": 180, "fat": 71}
-
-    lib = sb.table("food_library").select("name, cal, pro, carb, fat, unit").eq("user_id", user_id).execute()
-
-    log = (
-        sb.table("food_log")
-        .select("name, meal, cal, pro, carb, fat, qty")
-        .eq("user_id", user_id)
-        .eq("log_date", str(date.today()))
-        .execute()
-    )
-
+    goals, library, today_log = _load_context(sb, user_id)
     system_prompt = SYSTEM_TEMPLATE.format(
-        cal=g["cal"], pro=g["pro"], carb=g["carb"], fat=g["fat"],
-        library=json.dumps(lib.data),
-        log=json.dumps(log.data),
+        cal=goals["cal"], pro=goals["pro"], carb=goals["carb"], fat=goals["fat"],
+        today=str(date.today()),
+        library=json.dumps(library),
+        log=json.dumps(today_log),
     )
 
-    messages = [{"role": m.role, "content": m.content} for m in body.history]
-    messages.append({"role": "user", "content": body.message})
+    ctx = {"mutated": False}
+    tools = build_tools(sb, user_id, ctx)
+
+    agent = create_agent(model=llm, tools=tools, system_prompt=system_prompt)
+
+    messages = [_to_lc(m) for m in body.history]
+    messages.append(HumanMessage(content=body.message))
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            max_tokens=1000,
-            messages=[{"role": "system", "content": system_prompt}, *messages],
+        result = agent.invoke(
+            {"messages": messages},
+            config={"recursion_limit": 16},
         )
-        reply = response.choices[0].message.content
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM request failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Agent failed: {e}")
 
-    match = re.search(r"```log\n([\s\S]*?)\n```", reply)
-    display_reply = re.sub(r"```log[\s\S]*?```", "", reply).strip()
+    out_messages = result.get("messages", [])
 
-    logged_entries = []
-    if match:
-        try:
-            entries = json.loads(match.group(1))
-            for e in entries:
-                qty = e.get("qty", 1)
-                row = sb.table("food_log").insert({
-                    "user_id": user_id,
-                    "name": e["name"],
-                    "meal": e.get("meal", "Snack"),
-                    "cal": round(e["cal"] * qty),
-                    "pro": round(e["pro"] * qty, 1),
-                    "carb": round(e["carb"] * qty, 1),
-                    "fat": round(e["fat"] * qty, 1),
-                    "qty": qty,
-                    "log_date": str(date.today()),
-                }).execute()
-                logged_entries.append(row.data[0])
-        except (json.JSONDecodeError, KeyError) as err:
-            pass
+    # Pair each AIMessage tool_call with its ToolMessage observation by id.
+    tool_results: dict[str, str] = {
+        m.tool_call_id: str(m.content)
+        for m in out_messages
+        if isinstance(m, ToolMessage)
+    }
+    tool_calls: list[ToolCallInfo] = []
+    for m in out_messages:
+        if isinstance(m, AIMessage):
+            for tc in (m.tool_calls or []):
+                tool_calls.append(ToolCallInfo(
+                    name=tc["name"],
+                    args=_stringify_args(tc.get("args", {})),
+                    result=tool_results.get(tc.get("id", ""), ""),
+                ))
+
+    reply = ""
+    for m in reversed(out_messages):
+        if isinstance(m, AIMessage) and m.content:
+            reply = m.content if isinstance(m.content, str) else str(m.content)
+            break
 
     return ChatResponse(
-        reply=display_reply or "Done! Logged those items for you.",
-        logged_entries=logged_entries,
+        reply=reply,
+        mutated=ctx["mutated"],
+        tool_calls=tool_calls,
     )
