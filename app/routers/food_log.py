@@ -25,14 +25,15 @@ def get_log(log_date: Optional[date] = None, current_user: dict = Depends(get_cu
 
 @router.get("/history")
 def get_history(current_user: dict = Depends(get_current_user)):
-    """Returns daily calorie/macro totals grouped by date."""
+    """Returns daily calorie/macro totals grouped by date, including food entries per meal."""
     sb = get_service_client()
     result = (
         sb.table("food_log")
-        .select("log_date, cal, pro, carb, fat")
+        .select("id, log_date, meal, name, qty, cal, pro, carb, fat, created_at")
         .eq("user_id", current_user["user_id"])
         .order("log_date", desc=True)
-        .limit(500)
+        .order("created_at")
+        .limit(2000)
         .execute()
     )
 
@@ -40,13 +41,32 @@ def get_history(current_user: dict = Depends(get_current_user)):
     for row in result.data:
         d = row["log_date"]
         if d not in history:
-            history[d] = {"cal": 0, "pro": 0, "carb": 0, "fat": 0}
+            history[d] = {"cal": 0, "pro": 0, "carb": 0, "fat": 0, "entries": []}
         history[d]["cal"] += row["cal"]
         history[d]["pro"] += row["pro"]
         history[d]["carb"] += row["carb"]
         history[d]["fat"] += row["fat"]
+        history[d]["entries"].append({
+            "id": row["id"],
+            "meal": row["meal"],
+            "name": row["name"],
+            "qty": row["qty"],
+            "cal": row["cal"],
+            "pro": row["pro"],
+            "carb": row["carb"],
+            "fat": row["fat"],
+        })
 
-    return {d: {k: round(v, 1) for k, v in totals.items()} for d, totals in history.items()}
+    return {
+        d: {
+            "cal": round(totals["cal"], 1),
+            "pro": round(totals["pro"], 1),
+            "carb": round(totals["carb"], 1),
+            "fat": round(totals["fat"], 1),
+            "entries": totals["entries"],
+        }
+        for d, totals in history.items()
+    }
 
 
 @router.post("/", response_model=LogEntryResponse, status_code=201)
