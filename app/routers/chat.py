@@ -34,7 +34,15 @@ Guidelines:
 - Prefer nutrition values from the library when a close match exists; otherwise estimate from general knowledge.
 - For past-date operations, first call `list_log_entries` with that date to get ids.
 - Only call `update_goals` when the user explicitly asks to change their goals.
-- Be brief and specific. Do not repeat raw tool output verbatim; summarize."""
+- Be brief and specific. Do not repeat raw tool output verbatim; summarize.
+
+Image handling:
+- The user may attach images of food (meals, snacks, packaging) or nutrition labels.
+- For a food photo: identify each distinct item, estimate a reasonable portion size, and estimate macros per item using general nutrition knowledge.
+- For a nutrition label: read the serving size and macros directly from the label; use those exact values (scale by qty if the user indicates multiple servings).
+- If the user's intent is clear ("log this", "I ate this for lunch", "save this for later") act immediately: call `log_food` for each item, or `add_food_to_library` to save a reusable entry.
+- If intent is ambiguous (just an image with no context), briefly summarize what you see and your macro estimate, then ask whether to log it (and for which meal) or save it to the library.
+- If the image isn't food-related, say so and don't call any tools."""
 
 
 def _to_lc(m: ChatMessage):
@@ -89,7 +97,28 @@ def chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
     agent = create_agent(model=llm, tools=tools, system_prompt=system_prompt)
 
     messages = [_to_lc(m) for m in body.history]
-    messages.append(HumanMessage(content=body.message))
+
+    # Build the current user turn. If images are attached, send a multimodal
+    # HumanMessage so GPT-4o can actually see them.
+    if body.images:
+        parts: list = []
+        text = (body.message or "").strip()
+        # The model handles empty text fine, but include a neutral hint so
+        # the tool-calling agent still gets a clear instruction.
+        parts.append({
+            "type": "text",
+            "text": text or "Please analyze the attached image(s).",
+        })
+        for url in body.images:
+            if not url:
+                continue
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": url},
+            })
+        messages.append(HumanMessage(content=parts))
+    else:
+        messages.append(HumanMessage(content=body.message))
 
     try:
         result = agent.invoke(

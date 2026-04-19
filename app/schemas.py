@@ -65,6 +65,9 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: List[ChatMessage] = []
+    # Optional data URLs (e.g. "data:image/jpeg;base64,...") for images the user
+    # attached to the current message. Can be food photos or nutrition labels.
+    images: List[str] = []
 
 class ToolCallInfo(BaseModel):
     name: str
