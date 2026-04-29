@@ -21,3 +21,9 @@ app.include_router(chat.router, prefix="/chat", tags=["chat"])
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Macro Tracker API running"}
+
+
+@app.get("/health", tags=["health"])
+def health():
+    """Liveness/readiness probe for load balancers and orchestrators."""
+    return {"status": "healthy"}
